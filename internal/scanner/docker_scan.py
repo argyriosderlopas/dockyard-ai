@@ -8,8 +8,12 @@ import docker
 from internal.models.schema import BASE_SCHEMA
 
 
-def _labels(attrs: dict) -> dict:
+def _labels_from_container_attrs(attrs: dict) -> dict:
     return (attrs.get("Config") or {}).get("Labels") or {}
+
+
+def _labels_from_resource_attrs(attrs: dict) -> dict:
+    return attrs.get("Labels") or {}
 
 
 def _stack_key(labels: dict) -> tuple[str, str]:
@@ -31,13 +35,66 @@ def _container_networks(attrs: dict) -> list[str]:
     return sorted(list(nets.keys()))
 
 
-def _container_named_volumes(attrs: dict) -> list[str]:
+def _container_mounts(attrs: dict) -> dict:
+    """
+    Summarize mounts into:
+      - bind_mounts: [{"source","destination","rw"}]
+      - volume_mounts: [{"name","destination","rw"}]
+      - bind_sources: ["/path", ...]
+      - volume_names: ["vol1", ...]
+    """
     mounts = attrs.get("Mounts") or []
-    names: list[str] = []
+    binds: list[dict] = []
+    vols: list[dict] = []
+    bind_sources: list[str] = []
+    volume_names: list[str] = []
+
     for m in mounts:
-        if m.get("Type") == "volume" and m.get("Name"):
-            names.append(m["Name"])
-    return sorted(names)
+        mtype = m.get("Type")
+        dst = m.get("Destination")
+        rw = m.get("RW")
+
+        if mtype == "bind":
+            src = m.get("Source")
+            binds.append(
+                {
+                    "source": src,
+                    "destination": dst,
+                    "rw": bool(rw) if rw is not None else None,
+                }
+            )
+            if src:
+                bind_sources.append(src)
+
+        elif mtype == "volume":
+            nm = m.get("Name")
+            vols.append(
+                {
+                    "name": nm,
+                    "destination": dst,
+                    "rw": bool(rw) if rw is not None else None,
+                }
+            )
+            if nm:
+                volume_names.append(nm)
+
+    binds.sort(key=lambda x: (x.get("destination") or "", x.get("source") or ""))
+    vols.sort(key=lambda x: (x.get("destination") or "", x.get("name") or ""))
+
+    bind_sources = sorted(set(bind_sources))
+    volume_names = sorted(set(volume_names))
+
+    return {
+        "bind_mounts": binds,
+        "volume_mounts": vols,
+        "bind_sources": bind_sources,
+        "volume_names": volume_names,
+    }
+
+
+def _container_named_volumes(attrs: dict) -> list[str]:
+    # Backward compatible view used elsewhere
+    return _container_mounts(attrs).get("volume_names", [])
 
 
 def _container_published_ports(attrs: dict) -> list[dict]:
@@ -75,41 +132,66 @@ def _container_restart_policy(attrs: dict) -> str | None:
     return rp.get("Name")
 
 
-def _container_mounts_breakdown(attrs: dict) -> dict:
-    """
-    Summarize mounts into:
-      - bind_mounts: [{"source","destination","rw"}]
-      - volume_mounts: [{"name","destination","rw"}]
-    """
-    mounts = attrs.get("Mounts") or []
-    binds: list[dict] = []
-    vols: list[dict] = []
+def _container_exit_code(attrs: dict) -> int | None:
+    state = attrs.get("State") or {}
+    code = state.get("ExitCode")
+    return code if isinstance(code, int) else None
 
-    for m in mounts:
-        mtype = m.get("Type")
-        dst = m.get("Destination")
-        rw = m.get("RW")
 
-        if mtype == "bind":
-            binds.append(
+def _container_started_at(attrs: dict) -> str | None:
+    state = attrs.get("State") or {}
+    return state.get("StartedAt")
+
+
+def _container_finished_at(attrs: dict) -> str | None:
+    state = attrs.get("State") or {}
+    return state.get("FinishedAt")
+
+
+def _runtime_flags(networks: list[str], mounts: dict, published_ports: list[dict]) -> dict:
+    bind_sources = mounts.get("bind_sources") or []
+    docker_sock = any(src == "/var/run/docker.sock" for src in bind_sources)
+    host_network = "host" in (networks or [])
+    exposed = bool(published_ports)
+
+    return {
+        "exposed": exposed,
+        "docker_sock": docker_sock,
+        "host_network": host_network,
+        "bind_paths": bind_sources,
+        "volume_names": mounts.get("volume_names") or [],
+    }
+
+
+def _risk_flags(flags: dict) -> list[str]:
+    out: list[str] = []
+    if flags.get("docker_sock"):
+        out.append("docker_sock")
+    if flags.get("host_network"):
+        out.append("host_network")
+    if flags.get("exposed"):
+        out.append("published_ports")
+    return out
+
+
+def _stack_exposure_from_containers(stack_containers: list[dict]) -> list[dict]:
+    """
+    Build a stable list of exposure entries per stack:
+      {"container": "name", "host_ip": "...", "host_port": "...", "container_port": "..."}
+    """
+    exposure: list[dict] = []
+    for c in stack_containers:
+        for p in (c.get("published_ports") or []):
+            exposure.append(
                 {
-                    "source": m.get("Source"),
-                    "destination": dst,
-                    "rw": bool(rw) if rw is not None else None,
+                    "container": c.get("name"),
+                    "host_ip": p.get("host_ip"),
+                    "host_port": p.get("host_port"),
+                    "container_port": p.get("container_port"),
                 }
             )
-        elif mtype == "volume":
-            vols.append(
-                {
-                    "name": m.get("Name"),
-                    "destination": dst,
-                    "rw": bool(rw) if rw is not None else None,
-                }
-            )
-
-    binds.sort(key=lambda x: (x.get("destination") or "", x.get("source") or ""))
-    vols.sort(key=lambda x: (x.get("destination") or "", x.get("name") or ""))
-    return {"bind_mounts": binds, "volume_mounts": vols}
+    exposure.sort(key=lambda x: (x.get("host_port") or "", x.get("host_ip") or "", x.get("container") or "", x.get("container_port") or ""))
+    return exposure
 
 
 def scan_docker_environment():
@@ -127,16 +209,18 @@ def scan_docker_environment():
         attrs = c.attrs or {}
         created = attrs.get("Created")
 
-        labels = _labels(attrs)
+        labels = _labels_from_container_attrs(attrs)
         kind, stack_name = _stack_key(labels)
 
         c_networks = _container_networks(attrs)
-        c_volumes = _container_named_volumes(attrs)
 
         published_ports = _container_published_ports(attrs)
         health = _container_health(attrs)
         restart_policy = _container_restart_policy(attrs)
-        mounts_breakdown = _container_mounts_breakdown(attrs)
+        mounts = _container_mounts(attrs)
+
+        flags = _runtime_flags(c_networks, mounts, published_ports)
+        risk_flags = _risk_flags(flags)
 
         compose_project = labels.get("com.docker.compose.project")
 
@@ -157,17 +241,29 @@ def scan_docker_environment():
                 if compose_project
                 else None,
                 "networks": c_networks,
-                "volumes": c_volumes,
+                "volumes": _container_named_volumes(attrs),
                 "runtime": {
                     "published_ports": published_ports,
                     "health": health,
                     "restart_policy": restart_policy,
-                    "mounts": mounts_breakdown,
+                    "exit_code": _container_exit_code(attrs),
+                    "started_at": _container_started_at(attrs),
+                    "finished_at": _container_finished_at(attrs),
+                    "mounts": {
+                        "bind_mounts": mounts.get("bind_mounts") or [],
+                        "volume_mounts": mounts.get("volume_mounts") or [],
+                    },
+                    # A+: flags and rollups
+                    "exposed": flags.get("exposed"),
+                    "docker_sock": flags.get("docker_sock"),
+                    "host_network": flags.get("host_network"),
+                    "bind_paths": flags.get("bind_paths") or [],
+                    "volume_names": flags.get("volume_names") or [],
+                    "risk_flags": risk_flags,
                 },
             }
         )
 
-    # Deterministic order for top-level container list
     containers.sort(key=lambda x: x.get("name") or "")
 
     # ----------------------------
@@ -191,7 +287,7 @@ def scan_docker_environment():
     networks = []
     for n in client.networks.list():
         attrs = n.attrs or {}
-        nlabels = attrs.get("Labels") or {}
+        nlabels = _labels_from_resource_attrs(attrs)
         nkind, nstack = _stack_key(nlabels)
 
         networks.append(
@@ -211,7 +307,7 @@ def scan_docker_environment():
     volumes = []
     for v in client.volumes.list():
         attrs = v.attrs or {}
-        vlabels = attrs.get("Labels") or {}
+        vlabels = _labels_from_resource_attrs(attrs)
         vkind, vstack = _stack_key(vlabels)
 
         volumes.append(
@@ -247,6 +343,9 @@ def scan_docker_environment():
                 "services": {},
                 "networks": set(),
                 "volumes": set(),
+                # A+: stack rollups
+                "exposure": [],
+                "risk_flags": set(),
             },
         )
 
@@ -277,30 +376,50 @@ def scan_docker_environment():
         for vn in (c.get("volumes") or []):
             stacks_map[key]["volumes"].add(vn)
 
-        # Enriched container summary inside stack (A: ports/health/restart/mounts)
+        # Enriched container summary inside stack
         rt = c.get("runtime") or {}
-        stacks_map[key]["containers"].append(
-            {
-                "id": c["id"],
-                "name": c["name"],
-                "status": c["status"],
-                "image": c["image"],
-                "published_ports": rt.get("published_ports") or [],
-                "health": rt.get("health"),
-                "restart_policy": rt.get("restart_policy"),
-                "mounts": rt.get("mounts") or {"bind_mounts": [], "volume_mounts": []},
-            }
-        )
+        container_summary = {
+            "id": c["id"],
+            "name": c["name"],
+            "status": c["status"],
+            "image": c["image"],
+            "published_ports": rt.get("published_ports") or [],
+            "health": rt.get("health"),
+            "restart_policy": rt.get("restart_policy"),
+            "exit_code": rt.get("exit_code"),
+            "started_at": rt.get("started_at"),
+            "finished_at": rt.get("finished_at"),
+            "mounts": rt.get("mounts") or {"bind_mounts": [], "volume_mounts": []},
+            # A+: flags
+            "exposed": rt.get("exposed"),
+            "docker_sock": rt.get("docker_sock"),
+            "host_network": rt.get("host_network"),
+            "bind_paths": rt.get("bind_paths") or [],
+            "volume_names": rt.get("volume_names") or [],
+            "risk_flags": rt.get("risk_flags") or [],
+        }
+        stacks_map[key]["containers"].append(container_summary)
+
+        # A+: stack rollups
+        for rf in (rt.get("risk_flags") or []):
+            stacks_map[key]["risk_flags"].add(rf)
 
     stacks = list(stacks_map.values())
 
-    # Deterministic ordering and set conversion
+    # Deterministic ordering and set conversion + stack rollups
     stacks.sort(key=lambda s: (s["kind"], s["name"]))
     for s in stacks:
         s["containers"].sort(key=lambda x: x.get("name") or "")
         s["networks"] = sorted(list(s["networks"]))
         s["volumes"] = sorted(list(s["volumes"]))
 
+        # Exposure rollup from stack container summaries
+        s["exposure"] = _stack_exposure_from_containers(s["containers"])
+
+        # Risk flags rollup
+        s["risk_flags"] = sorted(list(s["risk_flags"]))
+
+        # Keep meta tidy
         if s["meta"].get("compose") is None:
             s["meta"].pop("compose", None)
         if s["meta"].get("portainer") is None:
