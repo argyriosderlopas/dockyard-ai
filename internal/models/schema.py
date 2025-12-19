@@ -1,3 +1,5 @@
+# internal/models/schema.py
+
 SCHEMA_VERSION = "0.1"
 
 BASE_SCHEMA = {
@@ -8,6 +10,6 @@ BASE_SCHEMA = {
         "images": [],
         "networks": [],
         "volumes": [],
-        "stacks": []
-    }
+        "stacks": [],
+    },
 }
