@@ -7,6 +7,7 @@ BASE_SCHEMA = {
         "containers": [],
         "images": [],
         "networks": [],
-        "volumes": []
+        "volumes": [],
+        "stacks": []
     }
 }
