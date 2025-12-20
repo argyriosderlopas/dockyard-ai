@@ -4,8 +4,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import sys
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Any
@@ -24,23 +24,14 @@ def _default_snapshot_dir() -> Path:
 def _find_latest_snapshot(snapshot_dir: Path) -> Optional[Path]:
     if not snapshot_dir.exists():
         return None
-    cands = sorted(
-        snapshot_dir.glob("dockyard_*.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    cands = sorted(snapshot_dir.glob("dockyard_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     return cands[0] if cands else None
-
-
-def _utc_stamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def _write_latest_pointer(repo_root: Path, snap_path: Path) -> None:
     target = repo_root / "dockyard_snapshot_latest.json"
     try:
         target.write_text(snap_path.read_text(encoding="utf-8"), encoding="utf-8")
-        os.chmod(target, 0o644)
     except Exception:
         return
 
@@ -61,6 +52,10 @@ def _maybe_relocate_snapshot(snap_path: Path, output_dir: Path) -> Path:
     dst_path = output_dir / snap_path.name
     shutil.copy2(snap_path, dst_path)
     return dst_path
+
+
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def _extract_path_from_scan_result(scan_result: Any) -> Optional[Path]:
@@ -96,12 +91,26 @@ def _write_snapshot_payload(output_dir: Path, payload: dict) -> Path:
     return snap_path
 
 
+def _safe_print(s: str = "", *, file=None) -> None:
+    """
+    Print that won't throw BrokenPipeError when output is piped and downstream exits early (e.g. head).
+    """
+    if file is None:
+        file = sys.stdout
+    try:
+        file.write(s + "\n")
+    except BrokenPipeError:
+        try:
+            file.flush()
+        except Exception:
+            pass
+        raise SystemExit(0)
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Scanner contract: returns snapshot dict payload (preferred),
-    # but tolerate legacy path-like returns to avoid breaking older branches.
     scan_result = scan_docker_environment()
 
     written_path = _extract_path_from_scan_result(scan_result)
@@ -109,16 +118,14 @@ def cmd_scan(args: argparse.Namespace) -> int:
         snap_path = _maybe_relocate_snapshot(written_path, out_dir)
     else:
         if not isinstance(scan_result, dict):
-            raise RuntimeError(
-                "scan_docker_environment() returned neither a snapshot path nor a snapshot dict payload."
-            )
+            raise RuntimeError("scan_docker_environment() returned neither a snapshot path nor a snapshot dict payload.")
         snap_path = _write_snapshot_payload(out_dir, scan_result)
 
     if args.write_latest:
         repo_root = Path(__file__).resolve().parents[1]
         _write_latest_pointer(repo_root=repo_root, snap_path=snap_path)
 
-    print(f"Wrote snapshot: {snap_path}")
+    _safe_print(f"Wrote snapshot: {snap_path}")
     return 0
 
 
@@ -132,22 +139,22 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     if snapshot_path is None:
         snapshot_path = _find_latest_snapshot(snapshot_dir)
         if snapshot_path is None:
-            print(f"No snapshots found under: {snapshot_dir}", file=sys.stderr)
+            _safe_print(f"No snapshots found under: {snapshot_dir}", file=sys.stderr)
             return 2
 
     if not snapshot_path.exists():
-        print(f"Snapshot not found: {snapshot_path}", file=sys.stderr)
+        _safe_print(f"Snapshot not found: {snapshot_path}", file=sys.stderr)
         return 2
 
     report = analyze_snapshot(snapshot_path=snapshot_path)
 
     if args.format == "json":
-        print(json.dumps(report, indent=2, sort_keys=False))
+        _safe_print(json.dumps(report, indent=2, sort_keys=False))
     else:
-        print(f"Snapshot: {snapshot_path}")
-        print(f"Scanned at: {report.get('scanned_at')}")
+        _safe_print(f"Snapshot: {snapshot_path}")
+        _safe_print(f"Scanned at: {report.get('scanned_at')}")
         s = report.get("summary", {})
-        print(
+        _safe_print(
             "Summary:"
             f" stacks={s.get('stacks_total', 0)}"
             f" containers={s.get('containers_total', 0)}"
@@ -156,19 +163,20 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             f" host_network_stacks={s.get('stacks_with_host_network', 0)}"
         )
 
-        print("\nTop risks:")
+        _safe_print("")
+        _safe_print("Top risks:")
         for row in report.get("top_risks", [])[: args.top]:
             name = (row.get("stack") or {}).get("name")
             flags = ",".join(row.get("risk_flags", []))
             score = row.get("risk_score", 0)
-            print(f"  - {name}: score={score} flags=[{flags}] findings={len(row.get('findings', []))}")
+            _safe_print(f"  - {name}: score={score} flags=[{flags}] findings={len(row.get('findings', []))}")
 
     if args.output:
         out_path = Path(args.output).expanduser().resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(report, indent=2, sort_keys=False) + "\n", encoding="utf-8")
-        os.chmod(out_path, 0o644)
-        print(f"\nWrote analysis: {out_path}")
+        _safe_print(f"")
+        _safe_print(f"Wrote analysis: {out_path}")
 
     return 0
 
