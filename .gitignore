@@ -1,6 +1,32 @@
+# Python / venv
 .venv/
 __pycache__/
-*.pyc
-*.json
+*.py[cod]
+*$py.class
+
+# Editors
 .vscode/
 .idea/
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Dockyard runtime output (do not commit)
+snapshots/
+out/
+
+# Optional: if you never want to commit the pointer file, keep this line.
+# If you DO want to commit it, remove the line below.
+dockyard_snapshot_latest.json
+
+# If you also create copies under a different path, ignore them explicitly:
+# /home/*/homelab/dockyard-ai/snapshots is outside repo, so not needed here.
+
+# Allow repo JSON assets explicitly (keep these at the bottom)
+!dockyard_inventory.json

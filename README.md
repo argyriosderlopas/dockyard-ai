@@ -1,49 +1,36 @@
 # dockyard-ai
 
-Dockyard AI is a local-first CLI tool that inspects a running Docker environment
-and produces a structured, machine-readable snapshot of what is actually running.
+Dockyard-AI is a local-first Docker inventory scanner and snapshot analyzer.
 
-It is designed for developers and operators who inherit Docker hosts
-without context, documentation, or ownership history.
+It is designed to be published on GitHub as a reproducible, CLI-driven tool:
+- `scan` connects to the local Docker daemon and writes a JSON snapshot.
+- `analyze` reads a snapshot and prints a deterministic risk summary.
 
-## What it does (today)
+## Repository layout
+dockyard/
+init.py
+main.py
+internal/
+init.py
+models/
+init.py
+schema.py
+scanner/
+init.py
+docker_scan.py
+README.md
+requirements.txt
+Makefile
 
-Dockyard AI connects to the local Docker engine and extracts:
+## Requirements
 
-- Containers (running and stopped)
-- Images
-- Networks
-- Volumes
+- Linux host with Docker installed and running
+- Python 3.12+ recommended (tested with Python 3.12)
+- Permission to access Docker (root or user in the `docker` group)
 
-The output is a single deterministic JSON document describing the environment
-at a specific point in time.
+## Install
 
-No inference. No modification. No orchestration.
-
-## What it does not do
-
-- It does not deploy containers
-- It does not manage Docker
-- It does not replace Portainer
-- It does not call any AI service
-- It does not require internet access
-
-## Why it exists
-
-Most Docker environments fail not because of technology,
-but because context is lost.
-
-Dockyard AI exists to recover that context.
-
-## Installation
-
-Requirements:
-- Python 3.9+
-- Docker Engine running locally
-- Access to the Docker socket
-
-Install dependency:
+### Using Makefile
 
 ```bash
-pip install docker
-
+make install

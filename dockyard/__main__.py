@@ -1,81 +1,206 @@
-# dockyard/__main__.py
+#!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import json
-import signal
+import os
+import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, Any
 
 from internal.scanner.docker_scan import scan_docker_environment
+from internal.analyzer.analyze_snapshot import analyze_snapshot
 
-DEFAULT_SNAPSHOT_DIR = Path("/home/aderlopas/homelab/dockyard-ai/snapshots")
+
+def _default_snapshot_dir() -> Path:
+    env = os.environ.get("DOCKYARD_SNAPSHOT_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
+    return (Path.home() / "homelab" / "dockyard-ai" / "snapshots").resolve()
 
 
-def write_snapshot(data: dict, out_dir: Path) -> Path:
+def _find_latest_snapshot(snapshot_dir: Path) -> Optional[Path]:
+    if not snapshot_dir.exists():
+        return None
+    cands = sorted(
+        snapshot_dir.glob("dockyard_*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return cands[0] if cands else None
+
+
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def _write_latest_pointer(repo_root: Path, snap_path: Path) -> None:
+    target = repo_root / "dockyard_snapshot_latest.json"
+    try:
+        target.write_text(snap_path.read_text(encoding="utf-8"), encoding="utf-8")
+        os.chmod(target, 0o644)
+    except Exception:
+        return
+
+
+def _maybe_relocate_snapshot(snap_path: Path, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        src_parent = snap_path.parent.resolve()
+        dst_parent = output_dir.resolve()
+    except Exception:
+        src_parent = snap_path.parent
+        dst_parent = output_dir
+
+    if src_parent == dst_parent:
+        return snap_path
+
+    dst_path = output_dir / snap_path.name
+    shutil.copy2(snap_path, dst_path)
+    return dst_path
+
+
+def _extract_path_from_scan_result(scan_result: Any) -> Optional[Path]:
+    if scan_result is None:
+        return None
+
+    if isinstance(scan_result, (str, os.PathLike)):
+        return Path(scan_result).expanduser()
+
+    if isinstance(scan_result, dict):
+        candidate_keys = (
+            "snapshot_path",
+            "snap_path",
+            "output_path",
+            "path",
+            "written_path",
+            "wrote_snapshot",
+            "file",
+        )
+        for k in candidate_keys:
+            v = scan_result.get(k)
+            if isinstance(v, (str, os.PathLike)) and str(v).strip():
+                return Path(v).expanduser()
+
+    return None
+
+
+def _write_snapshot_payload(output_dir: Path, payload: dict) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    snap_path = output_dir / f"dockyard_{_utc_stamp()}.json"
+    snap_path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    os.chmod(snap_path, 0o644)
+    return snap_path
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    scanned_at = (data.get("scanned_at") or "").strip()
-    # filename-safe timestamp: remove separators that break filenames or sorting
-    ts = (
-        scanned_at.replace(":", "")
-        .replace("-", "")
-        .replace(".", "")
-        .replace("Z", "Z")
-    )
-    if not ts:
-        ts = "snapshot"
+    # Scanner contract: returns snapshot dict payload (preferred),
+    # but tolerate legacy path-like returns to avoid breaking older branches.
+    scan_result = scan_docker_environment()
 
-    path = out_dir / f"dockyard_{ts}.json"
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    return path
+    written_path = _extract_path_from_scan_result(scan_result)
+    if written_path is not None and written_path.exists():
+        snap_path = _maybe_relocate_snapshot(written_path, out_dir)
+    else:
+        if not isinstance(scan_result, dict):
+            raise RuntimeError(
+                "scan_docker_environment() returned neither a snapshot path nor a snapshot dict payload."
+            )
+        snap_path = _write_snapshot_payload(out_dir, scan_result)
+
+    if args.write_latest:
+        repo_root = Path(__file__).resolve().parents[1]
+        _write_latest_pointer(repo_root=repo_root, snap_path=snap_path)
+
+    print(f"Wrote snapshot: {snap_path}")
+    return 0
 
 
-def main() -> int:
-    # When piping to tools like `head`, the consumer closes stdout early.
-    # This prevents noisy BrokenPipeError tracebacks on Linux.
-    try:
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-    except Exception:
-        # Non-POSIX environments or restricted signal handling
-        pass
+def cmd_analyze(args: argparse.Namespace) -> int:
+    snapshot_path: Optional[Path] = None
+    if args.snapshot:
+        snapshot_path = Path(args.snapshot).expanduser().resolve()
 
-    parser = argparse.ArgumentParser(prog="dockyard", add_help=True)
-    parser.add_argument(
-        "--output",
-        action="store_true",
-        help="Write a snapshot JSON file under /home/aderlopas/homelab/dockyard-ai/snapshots",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=str(DEFAULT_SNAPSHOT_DIR),
-        help="Directory to write snapshots (default: /home/aderlopas/homelab/dockyard-ai/snapshots)",
-    )
-    args = parser.parse_args()
+    snapshot_dir = Path(args.snapshot_dir).expanduser().resolve()
 
-    try:
-        data = scan_docker_environment()
+    if snapshot_path is None:
+        snapshot_path = _find_latest_snapshot(snapshot_dir)
+        if snapshot_path is None:
+            print(f"No snapshots found under: {snapshot_dir}", file=sys.stderr)
+            return 2
 
-        # Always print JSON to stdout
-        try:
-            sys.stdout.write(json.dumps(data, indent=2) + "\n")
-            sys.stdout.flush()
-        except BrokenPipeError:
-            # Downstream closed pipe (e.g., `| head`). Exit quietly.
-            try:
-                sys.stdout.close()
-            except Exception:
-                pass
-            return 0
-
-        # Optionally write snapshot to disk
-        if args.output:
-            out_path = write_snapshot(data, Path(args.output_dir))
-            print(f"Wrote snapshot: {out_path}", file=sys.stderr)
-
-        return 0
-
-    except Exception as e:
-        print(str(e), file=sys.stderr)
+    if not snapshot_path.exists():
+        print(f"Snapshot not found: {snapshot_path}", file=sys.stderr)
         return 2
+
+    report = analyze_snapshot(snapshot_path=snapshot_path)
+
+    if args.format == "json":
+        print(json.dumps(report, indent=2, sort_keys=False))
+    else:
+        print(f"Snapshot: {snapshot_path}")
+        print(f"Scanned at: {report.get('scanned_at')}")
+        s = report.get("summary", {})
+        print(
+            "Summary:"
+            f" stacks={s.get('stacks_total', 0)}"
+            f" containers={s.get('containers_total', 0)}"
+            f" exposed_stacks={s.get('stacks_exposed', 0)}"
+            f" docker_sock_stacks={s.get('stacks_with_docker_sock', 0)}"
+            f" host_network_stacks={s.get('stacks_with_host_network', 0)}"
+        )
+
+        print("\nTop risks:")
+        for row in report.get("top_risks", [])[: args.top]:
+            name = (row.get("stack") or {}).get("name")
+            flags = ",".join(row.get("risk_flags", []))
+            score = row.get("risk_score", 0)
+            print(f"  - {name}: score={score} flags=[{flags}] findings={len(row.get('findings', []))}")
+
+    if args.output:
+        out_path = Path(args.output).expanduser().resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+        os.chmod(out_path, 0o644)
+        print(f"\nWrote analysis: {out_path}")
+
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dockyard", description="Dockyard-AI: scan Docker, then analyze snapshots.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    scan = sub.add_parser("scan", help="Capture a Docker snapshot JSON.")
+    scan.add_argument("--output-dir", default=str(_default_snapshot_dir()), help="Directory to write snapshots.")
+    scan.add_argument(
+        "--write-latest",
+        action="store_true",
+        help="Write a copy of the latest snapshot to ./dockyard_snapshot_latest.json",
+    )
+    scan.set_defaults(func=cmd_scan)
+
+    analyze = sub.add_parser("analyze", help="Analyze a snapshot JSON (no Docker calls).")
+    analyze.add_argument("--snapshot", default="", help="Path to a snapshot JSON. If empty, uses latest in snapshot-dir.")
+    analyze.add_argument("--snapshot-dir", default=str(_default_snapshot_dir()), help="Directory to look for snapshots.")
+    analyze.add_argument("--format", choices=["text", "json"], default="text", help="Output format.")
+    analyze.add_argument("--top", type=int, default=10, help="Top N risky stacks to show in text format.")
+    analyze.add_argument("--output", default="", help="Write full analysis JSON to this path.")
+    analyze.set_defaults(func=cmd_analyze)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args))
 
 
 if __name__ == "__main__":
