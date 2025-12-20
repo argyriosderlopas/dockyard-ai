@@ -36,6 +36,14 @@ def _write_latest_pointer(repo_root: Path, snap_path: Path) -> None:
         return
 
 
+def _write_latest_analysis(repo_root: Path, report: dict) -> None:
+    target = repo_root / "dockyard_analysis_latest.json"
+    try:
+        target.write_text(json.dumps(report, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    except Exception:
+        return
+
+
 def _maybe_relocate_snapshot(snap_path: Path, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -91,20 +99,19 @@ def _write_snapshot_payload(output_dir: Path, payload: dict) -> Path:
     return snap_path
 
 
-def _safe_print(s: str = "", *, file=None) -> None:
-    """
-    Print that won't throw BrokenPipeError when output is piped and downstream exits early (e.g. head).
-    """
-    if file is None:
-        file = sys.stdout
+def _safe_write_line(text: str, *, stream) -> None:
     try:
-        file.write(s + "\n")
+        stream.write(text + "\n")
     except BrokenPipeError:
-        try:
-            file.flush()
-        except Exception:
-            pass
         raise SystemExit(0)
+
+
+def _safe_print(text: str = "") -> None:
+    _safe_write_line(text, stream=sys.stdout)
+
+
+def _safe_eprint(text: str = "") -> None:
+    _safe_write_line(text, stream=sys.stderr)
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -139,14 +146,17 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     if snapshot_path is None:
         snapshot_path = _find_latest_snapshot(snapshot_dir)
         if snapshot_path is None:
-            _safe_print(f"No snapshots found under: {snapshot_dir}", file=sys.stderr)
+            _safe_eprint(f"No snapshots found under: {snapshot_dir}")
             return 2
 
     if not snapshot_path.exists():
-        _safe_print(f"Snapshot not found: {snapshot_path}", file=sys.stderr)
+        _safe_eprint(f"Snapshot not found: {snapshot_path}")
         return 2
 
-    report = analyze_snapshot(snapshot_path=snapshot_path)
+    report = analyze_snapshot(
+        snapshot_path=snapshot_path,
+        fail_on=args.fail_on,
+    )
 
     if args.format == "json":
         _safe_print(json.dumps(report, indent=2, sort_keys=False))
@@ -163,6 +173,16 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             f" host_network_stacks={s.get('stacks_with_host_network', 0)}"
         )
 
+        counts = (s.get("findings_by_severity") or {})
+        if counts:
+            _safe_print(
+                "Findings:"
+                f" critical={counts.get('critical', 0)}"
+                f" high={counts.get('high', 0)}"
+                f" medium={counts.get('medium', 0)}"
+                f" low={counts.get('low', 0)}"
+            )
+
         _safe_print("")
         _safe_print("Top risks:")
         for row in report.get("top_risks", [])[: args.top]:
@@ -175,10 +195,15 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         out_path = Path(args.output).expanduser().resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(report, indent=2, sort_keys=False) + "\n", encoding="utf-8")
-        _safe_print(f"")
+        _safe_print("")
         _safe_print(f"Wrote analysis: {out_path}")
 
-    return 0
+    if args.write_latest:
+        repo_root = Path(__file__).resolve().parents[1]
+        _write_latest_analysis(repo_root=repo_root, report=report)
+
+    fail_meta = report.get("policy") or {}
+    return int(fail_meta.get("exit_code", 0))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -200,6 +225,17 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--format", choices=["text", "json"], default="text", help="Output format.")
     analyze.add_argument("--top", type=int, default=10, help="Top N risky stacks to show in text format.")
     analyze.add_argument("--output", default="", help="Write full analysis JSON to this path.")
+    analyze.add_argument(
+        "--write-latest",
+        action="store_true",
+        help="Write a copy of the latest analysis report to ./dockyard_analysis_latest.json",
+    )
+    analyze.add_argument(
+        "--fail-on",
+        choices=["none", "low", "medium", "high", "critical"],
+        default="none",
+        help="Exit non-zero if any finding severity is >= threshold (useful for CI).",
+    )
     analyze.set_defaults(func=cmd_analyze)
 
     return p

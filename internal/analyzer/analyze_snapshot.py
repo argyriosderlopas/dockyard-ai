@@ -6,260 +6,409 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
+ANALYSIS_SCHEMA_VERSION = "analysis.v1"
+
+
+_SEVERITY_ORDER: Dict[str, int] = {
+    "none": 0,
+    "low": 10,
+    "medium": 20,
+    "high": 30,
+    "critical": 40,
+}
+
+
 @dataclass(frozen=True)
 class Finding:
     code: str
-    severity: str  # low | medium | high | critical
+    severity: str
     title: str
     evidence: Dict[str, Any]
 
-
-def _load_snapshot(snapshot_path: Path) -> Dict[str, Any]:
-    d = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    if not isinstance(d, dict):
-        raise ValueError("Snapshot root must be a JSON object.")
-    return d
-
-
-def _get_stacks(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
-    docker = snapshot.get("docker") or {}
-    stacks = docker.get("stacks") or []
-    if not isinstance(stacks, list):
-        return []
-    return [s for s in stacks if isinstance(s, dict)]
+    def as_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "severity": self.severity,
+            "title": self.title,
+            "evidence": self.evidence,
+        }
 
 
-def _get_containers(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
-    docker = snapshot.get("docker") or {}
-    containers = docker.get("containers") or []
+def _load_snapshot(snapshot_path: Path) -> dict:
+    raw = snapshot_path.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("Snapshot JSON must be a JSON object.")
+    return data
+
+
+def _get(obj: dict, path: List[str], default=None):
+    cur = obj
+    for p in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(p)
+    return cur if cur is not None else default
+
+
+def _normalize_containers(snapshot: dict) -> List[dict]:
+    containers = _get(snapshot, ["docker", "containers"], default=[])
     if not isinstance(containers, list):
         return []
-    return [c for c in containers if isinstance(c, dict)]
-
-
-def _risk_score_from_flags(flags: List[str]) -> int:
-    # Deterministic and explainable. Tunable later.
-    weights = {
-        "docker_sock": 60,
-        "host_network": 35,
-        "published_ports": 25,
-    }
-    return int(sum(weights.get(f, 0) for f in flags))
-
-
-def _normalize_host_ip(host_ip: str) -> str:
-    # Standardize common representations.
-    if host_ip in ("0.0.0.0", "::"):
-        return host_ip
-    return host_ip.strip()
-
-
-def _is_world_bind(host_ip: str) -> bool:
-    ip = _normalize_host_ip(host_ip)
-    return ip in ("0.0.0.0", "::")
-
-
-def _port_exposure_findings(exposure: List[Dict[str, Any]]) -> List[Finding]:
-    findings: List[Finding] = []
-    if not exposure:
-        return findings
-
-    world = [e for e in exposure if _is_world_bind(str(e.get("host_ip", "")))]
-    if world:
-        findings.append(
-            Finding(
-                code="published_ports_world",
-                severity="high",
-                title="Published ports bound to all interfaces",
-                evidence={"exposure": world},
-            )
-        )
-
-    # Identify likely-admin ports (heuristic, not claims).
-    suspicious_ports = {"9000", "9443", "8200", "3000", "8080", "8081", "8083", "8085", "8088", "61208"}
-    adminish = [e for e in exposure if str(e.get("host_port", "")) in suspicious_ports]
-    if adminish:
-        findings.append(
-            Finding(
-                code="published_ports_common_admin",
-                severity="medium",
-                title="Published ports include common admin/UI ports",
-                evidence={"exposure": adminish},
-            )
-        )
-
-    return findings
-
-
-def _docker_sock_findings(stack: Dict[str, Any]) -> List[Finding]:
-    findings: List[Finding] = []
-    containers = stack.get("containers") or []
-    if not isinstance(containers, list):
-        return findings
-
-    sock_mounts: List[Dict[str, Any]] = []
+    out: List[dict] = []
     for c in containers:
-        if not isinstance(c, dict):
-            continue
-        mounts = ((c.get("mounts") or {}).get("bind_mounts") or []) if isinstance(c.get("mounts"), dict) else []
-        for m in mounts:
-            if not isinstance(m, dict):
-                continue
-            if str(m.get("source", "")) == "/var/run/docker.sock":
-                sock_mounts.append(
-                    {
-                        "container": c.get("name"),
-                        "rw": bool(m.get("rw", False)),
-                        "destination": m.get("destination"),
-                    }
-                )
-
-    if sock_mounts:
-        rw = [x for x in sock_mounts if x.get("rw") is True]
-        sev = "critical" if rw else "high"
-        findings.append(
-            Finding(
-                code="docker_socket_mount",
-                severity=sev,
-                title="Docker socket mounted into container(s)",
-                evidence={"docker_sock_mounts": sock_mounts},
-            )
-        )
-
-    return findings
+        if isinstance(c, dict):
+            out.append(c)
+    out.sort(key=lambda x: (str(x.get("name") or ""), str(x.get("id") or "")))
+    return out
 
 
-def _host_network_findings(stack: Dict[str, Any]) -> List[Finding]:
-    nets = stack.get("networks") or []
+def _stack_id_from_container(c: dict) -> Tuple[str, str]:
+    stk = c.get("stack") if isinstance(c.get("stack"), dict) else {}
+    kind = (stk.get("kind") or "ungrouped").strip()
+    name = (stk.get("name") or "ungrouped").strip()
+    if not kind:
+        kind = "ungrouped"
+    if not name:
+        name = "ungrouped"
+    return (kind, name)
+
+
+def _service_name_for_container(c: dict) -> str:
+    compose = c.get("compose") if isinstance(c.get("compose"), dict) else None
+    if compose and compose.get("service"):
+        return str(compose.get("service"))
+    name = c.get("name")
+    return str(name) if name else "unknown"
+
+
+def _published_ports(c: dict) -> List[dict]:
+    runtime = c.get("runtime") if isinstance(c.get("runtime"), dict) else {}
+    ports = runtime.get("published_ports")
+    if not isinstance(ports, list):
+        return []
+    out: List[dict] = []
+    for p in ports:
+        if isinstance(p, dict):
+            out.append(p)
+    return out
+
+
+def _container_flags(c: dict) -> Dict[str, bool]:
+    runtime = c.get("runtime") if isinstance(c.get("runtime"), dict) else {}
+    exposed = bool(runtime.get("exposed"))
+    docker_sock = bool(runtime.get("docker_sock"))
+    host_network = bool(runtime.get("host_network"))
+    return {"exposed": exposed, "docker_sock": docker_sock, "host_network": host_network}
+
+
+def _container_networks(c: dict) -> List[str]:
+    nets = c.get("networks")
     if not isinstance(nets, list):
         return []
-    if "host" in nets:
-        return [
+    return sorted([str(x) for x in nets if x is not None])
+
+
+def _container_bind_paths(c: dict) -> List[str]:
+    runtime = c.get("runtime") if isinstance(c.get("runtime"), dict) else {}
+    paths = runtime.get("bind_paths")
+    if not isinstance(paths, list):
+        return []
+    return sorted([str(x) for x in paths if x is not None])
+
+
+def _container_restart_policy(c: dict) -> Optional[str]:
+    runtime = c.get("runtime") if isinstance(c.get("runtime"), dict) else {}
+    rp = runtime.get("restart_policy")
+    if rp is None:
+        return None
+    s = str(rp).strip()
+    return s if s else None
+
+
+def _container_status(c: dict) -> str:
+    st = c.get("status")
+    return str(st) if st is not None else ""
+
+
+def _container_health(c: dict) -> Optional[str]:
+    runtime = c.get("runtime") if isinstance(c.get("runtime"), dict) else {}
+    h = runtime.get("health")
+    if h is None:
+        return None
+    s = str(h).strip()
+    return s if s else None
+
+
+def _findings_for_stack(containers: List[dict]) -> List[Finding]:
+    findings: List[Finding] = []
+
+    any_host = any(_container_flags(c).get("host_network") for c in containers)
+    if any_host:
+        ev = {"networks": ["host"]}
+        findings.append(
             Finding(
                 code="host_network",
                 severity="high",
                 title="Stack uses host networking",
-                evidence={"networks": nets},
-            )
-        ]
-    return []
-
-
-def _rw_bind_mount_findings(stack: Dict[str, Any]) -> List[Finding]:
-    findings: List[Finding] = []
-    containers = stack.get("containers") or []
-    if not isinstance(containers, list):
-        return findings
-
-    rw_binds: List[Dict[str, Any]] = []
-    for c in containers:
-        if not isinstance(c, dict):
-            continue
-        mounts = c.get("mounts") or {}
-        if not isinstance(mounts, dict):
-            continue
-        binds = mounts.get("bind_mounts") or []
-        if not isinstance(binds, list):
-            continue
-        for b in binds:
-            if not isinstance(b, dict):
-                continue
-            # Exclude docker.sock here (handled by dedicated finding)
-            if str(b.get("source", "")) == "/var/run/docker.sock":
-                continue
-            if bool(b.get("rw", False)) is True:
-                rw_binds.append(
-                    {
-                        "container": c.get("name"),
-                        "source": b.get("source"),
-                        "destination": b.get("destination"),
-                    }
-                )
-
-    if rw_binds:
-        findings.append(
-            Finding(
-                code="rw_bind_mounts",
-                severity="medium",
-                title="Writable bind mounts detected",
-                evidence={"rw_bind_mounts": rw_binds},
+                evidence=ev,
             )
         )
+
+    any_sock = any(_container_flags(c).get("docker_sock") for c in containers)
+    if any_sock:
+        sock_containers = sorted([str(c.get("name") or "") for c in containers if _container_flags(c).get("docker_sock")])
+        findings.append(
+            Finding(
+                code="docker_sock",
+                severity="critical",
+                title="Stack mounts the Docker socket (root-equivalent access)",
+                evidence={"containers": sock_containers, "path": "/var/run/docker.sock"},
+            )
+        )
+
+    exposed = []
+    for c in containers:
+        for p in _published_ports(c):
+            exposed.append(
+                {
+                    "container": c.get("name"),
+                    "host_ip": p.get("host_ip"),
+                    "host_port": p.get("host_port"),
+                    "container_port": p.get("container_port"),
+                }
+            )
+    if exposed:
+        exposed.sort(
+            key=lambda x: (
+                str(x.get("host_port") or ""),
+                str(x.get("host_ip") or ""),
+                str(x.get("container") or ""),
+                str(x.get("container_port") or ""),
+            )
+        )
+        findings.append(
+            Finding(
+                code="published_ports",
+                severity="medium",
+                title="Stack publishes ports to the host",
+                evidence={"ports": exposed[:50], "ports_count": len(exposed)},
+            )
+        )
+
+    # Operational hygiene signals (useful, low severity)
+    unhealthy = []
+    for c in containers:
+        h = _container_health(c)
+        if h and h.lower() not in ("healthy",):
+            unhealthy.append({"container": c.get("name"), "health": h})
+    if unhealthy:
+        findings.append(
+            Finding(
+                code="unhealthy",
+                severity="low",
+                title="One or more containers report unhealthy or unknown health status",
+                evidence={"containers": unhealthy},
+            )
+        )
+
+    no_restart = []
+    for c in containers:
+        rp = _container_restart_policy(c)
+        if not rp or rp == "no":
+            status = _container_status(c).lower()
+            # Ignore exited containers for this signal unless they are supposed to be long-running.
+            if status in ("running", "restarting"):
+                no_restart.append({"container": c.get("name"), "restart_policy": rp or "none"})
+    if no_restart:
+        findings.append(
+            Finding(
+                code="no_restart_policy",
+                severity="low",
+                title="One or more running containers have no restart policy",
+                evidence={"containers": no_restart},
+            )
+        )
+
+    # Broad bind-mount signal (can be risky, but depends on context)
+    bind_paths = sorted({p for c in containers for p in _container_bind_paths(c)})
+    if bind_paths:
+        findings.append(
+            Finding(
+                code="bind_mounts",
+                severity="low",
+                title="Stack uses bind mounts (review host path exposure)",
+                evidence={"bind_paths": bind_paths[:80], "bind_paths_count": len(bind_paths)},
+            )
+        )
+
     return findings
 
 
-def _stack_findings(stack: Dict[str, Any]) -> List[Finding]:
-    findings: List[Finding] = []
-    exposure = stack.get("exposure") or []
-    if isinstance(exposure, list):
-        findings.extend(_port_exposure_findings(exposure))
-
-    findings.extend(_docker_sock_findings(stack))
-    findings.extend(_host_network_findings(stack))
-    findings.extend(_rw_bind_mount_findings(stack))
-
-    return findings
-
-
-def _severity_rank(sev: str) -> int:
-    order = {"low": 10, "medium": 20, "high": 30, "critical": 40}
-    return int(order.get(sev, 0))
+def _risk_flags_from_findings(findings: List[Finding]) -> List[str]:
+    codes = {f.code for f in findings}
+    out: List[str] = []
+    if "docker_sock" in codes:
+        out.append("docker_sock")
+    if "host_network" in codes:
+        out.append("host_network")
+    if "published_ports" in codes:
+        out.append("published_ports")
+    return out
 
 
-def analyze_snapshot(snapshot_path: Path) -> Dict[str, Any]:
-    snap = _load_snapshot(snapshot_path)
-    stacks = _get_stacks(snap)
-    containers = _get_containers(snap)
+def _risk_score(findings: List[Finding]) -> int:
+    # Deterministic score used for sorting. Higher is worse.
+    # Weight by severity and by common “blast radius” signals.
+    weights = {
+        "critical": 90,
+        "high": 45,
+        "medium": 25,
+        "low": 5,
+    }
+    score = 0
+    for f in findings:
+        score += int(weights.get(f.severity, 0))
+        # Nudge common high-impact codes
+        if f.code == "docker_sock":
+            score += 25
+        if f.code == "host_network":
+            score += 10
+        if f.code == "published_ports":
+            ports_count = int((f.evidence or {}).get("ports_count") or 0)
+            score += min(30, ports_count * 2)
+    return score
 
-    analyzed: List[Dict[str, Any]] = []
+
+def _stack_exposure(stack_containers: List[dict]) -> List[dict]:
+    exposure: List[dict] = []
+    for c in stack_containers:
+        for p in _published_ports(c):
+            exposure.append(
+                {
+                    "container": c.get("name"),
+                    "host_ip": p.get("host_ip"),
+                    "host_port": p.get("host_port"),
+                    "container_port": p.get("container_port"),
+                }
+            )
+    exposure.sort(
+        key=lambda x: (
+            str(x.get("host_port") or ""),
+            str(x.get("host_ip") or ""),
+            str(x.get("container") or ""),
+            str(x.get("container_port") or ""),
+        )
+    )
+    return exposure
+
+
+def _services_breakdown(stack_containers: List[dict]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for c in stack_containers:
+        svc = _service_name_for_container(c)
+        out[svc] = out.get(svc, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: (kv[0], kv[1])))
+
+
+def _findings_by_severity(stacks: List[dict]) -> Dict[str, int]:
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
     for s in stacks:
-        risk_flags = s.get("risk_flags") or []
-        if not isinstance(risk_flags, list):
-            risk_flags = []
+        for f in (s.get("findings") or []):
+            if not isinstance(f, dict):
+                continue
+            sev = str(f.get("severity") or "").lower()
+            if sev in counts:
+                counts[sev] += 1
+    return counts
 
-        exposure = s.get("exposure") or []
-        if not isinstance(exposure, list):
-            exposure = []
 
-        findings = _stack_findings(s)
+def _policy_eval(stacks: List[dict], fail_on: str) -> dict:
+    threshold = _SEVERITY_ORDER.get((fail_on or "none").lower(), 0)
+    worst = 0
+    worst_label = "none"
 
-        score = _risk_score_from_flags([str(x) for x in risk_flags])
-        # Findings add to the score in a bounded way (keeps flags as the primary axis).
-        score += sum(_severity_rank(f.severity) for f in findings) // 4
+    for s in stacks:
+        for f in (s.get("findings") or []):
+            if not isinstance(f, dict):
+                continue
+            sev = str(f.get("severity") or "none").lower()
+            sev_score = _SEVERITY_ORDER.get(sev, 0)
+            if sev_score > worst:
+                worst = sev_score
+                worst_label = sev
 
-        analyzed.append(
+    failed = worst >= threshold and threshold > 0
+    exit_code = 3 if failed else 0
+
+    return {
+        "fail_on": (fail_on or "none").lower(),
+        "threshold": threshold,
+        "worst_severity": worst_label,
+        "failed": failed,
+        "exit_code": exit_code,
+    }
+
+
+def analyze_snapshot(snapshot_path: Path, fail_on: str = "none") -> dict:
+    sp = Path(snapshot_path).expanduser().resolve()
+    snapshot = _load_snapshot(sp)
+
+    input_schema_version = str(snapshot.get("schema_version") or "")
+    scanned_at = snapshot.get("scanned_at")
+
+    containers = _normalize_containers(snapshot)
+
+    stacks_map: Dict[Tuple[str, str], List[dict]] = {}
+    for c in containers:
+        sid = _stack_id_from_container(c)
+        stacks_map.setdefault(sid, []).append(c)
+
+    stacks_out: List[dict] = []
+    for (kind, name), stack_containers in sorted(stacks_map.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        findings = _findings_for_stack(stack_containers)
+        flags = _risk_flags_from_findings(findings)
+
+        stacks_out.append(
             {
-                "stack": {"kind": s.get("kind"), "name": s.get("name")},
-                "services": s.get("services") or {},
-                "risk_flags": [str(x) for x in risk_flags],
-                "exposure": exposure,
-                "risk_score": int(score),
-                "findings": [
-                    {"code": f.code, "severity": f.severity, "title": f.title, "evidence": f.evidence} for f in findings
-                ],
+                "stack": {"kind": kind, "name": name},
+                "services": _services_breakdown(stack_containers),
+                "risk_flags": flags,
+                "exposure": _stack_exposure(stack_containers),
+                "risk_score": _risk_score(findings),
+                "findings": [f.as_dict() for f in findings],
             }
         )
 
-    # Summary (counts are factual, derived from snapshot only).
-    stacks_exposed = sum(1 for x in analyzed if isinstance(x.get("exposure"), list) and len(x["exposure"]) > 0)
-    stacks_sock = sum(1 for x in analyzed if "docker_sock" in (x.get("risk_flags") or []))
-    stacks_hostnet = sum(1 for x in analyzed if "host_network" in (x.get("risk_flags") or []))
+    stacks_total = len(stacks_out)
+    containers_total = len(containers)
 
-    # Sort top risks
-    top_risks = sorted(analyzed, key=lambda x: int(x.get("risk_score", 0)), reverse=True)
+    stacks_exposed = sum(1 for s in stacks_out if "published_ports" in (s.get("risk_flags") or []))
+    stacks_with_docker_sock = sum(1 for s in stacks_out if "docker_sock" in (s.get("risk_flags") or []))
+    stacks_with_host_network = sum(1 for s in stacks_out if "host_network" in (s.get("risk_flags") or []))
 
-    return {
-        "schema_version": "analysis.v1",
-        "input_schema_version": snap.get("schema_version"),
-        "scanned_at": snap.get("scanned_at"),
-        "snapshot_path": str(snapshot_path),
-        "summary": {
-            "stacks_total": len(stacks),
-            "containers_total": len(containers),
-            "stacks_exposed": int(stacks_exposed),
-            "stacks_with_docker_sock": int(stacks_sock),
-            "stacks_with_host_network": int(stacks_hostnet),
-        },
-        "stacks": analyzed,
-        "top_risks": top_risks,
+    top_risks = sorted(stacks_out, key=lambda s: int(s.get("risk_score") or 0), reverse=True)
+
+    summary = {
+        "stacks_total": stacks_total,
+        "containers_total": containers_total,
+        "stacks_exposed": stacks_exposed,
+        "stacks_with_docker_sock": stacks_with_docker_sock,
+        "stacks_with_host_network": stacks_with_host_network,
+        "findings_by_severity": _findings_by_severity(stacks_out),
     }
+
+    policy = _policy_eval(stacks_out, fail_on=fail_on)
+
+    report = {
+        "schema_version": ANALYSIS_SCHEMA_VERSION,
+        "input_schema_version": input_schema_version,
+        "scanned_at": scanned_at,
+        "snapshot_path": str(sp),
+        "summary": summary,
+        "stacks": stacks_out,
+        "top_risks": top_risks,
+        "policy": policy,
+    }
+
+    return report
